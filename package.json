@@ -1,0 +1,28 @@
+{
+  "name": "instareplyer",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "turbo dev",
+    "build": "turbo build",
+    "lint": "turbo lint",
+    "dev:landing": "turbo dev --filter=@instareplyer/landing",
+    "dev:client": "turbo dev --filter=@instareplyer/client",
+    "dev:backend": "turbo dev --filter=@instareplyer/backend",
+    "dev:cms": "turbo dev --filter=@instareplyer/cms",
+    "clean": "turbo clean && rm -rf node_modules",
+    "format": "prettier --write \"**/*.{ts,tsx,md}\""
+  },
+  "devDependencies": {
+    "turbo": "^2.4.0",
+    "prettier": "^3.3.0"
+  },
+  "packageManager": "pnpm@9.15.0",
+  "engines": {
+    "node": ">=20"
+  }
+}
