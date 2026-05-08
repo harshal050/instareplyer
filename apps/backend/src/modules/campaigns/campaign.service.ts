@@ -3,6 +3,7 @@ import type { Campaign } from '@instareplyer/types';
 import type { CreateCampaignInput, UpdateCampaignInput } from './campaign.validation.js';
 import { env } from '../../config/env.js';
 import { NotFoundError, BadRequestError } from '../../utils/errors.js';
+import logger from '../../utils/logger.js';
 
 export class CampaignService {
   async createCampaign(userId: string, data: CreateCampaignInput): Promise<Campaign> {
@@ -21,7 +22,7 @@ export class CampaignService {
       posts: data.posts || [],
       keywords: data.keywords?.map((kw, idx) => ({
         id: `kw_${idx}`,
-        keyword: kw.keyword,
+        keyword: kw.keyword.trim(),
         matchType: kw.matchType || 'contains',
         isEnabled: kw.isEnabled ?? true,
       })) || [],
@@ -90,10 +91,11 @@ export class CampaignService {
     if (data.keywords !== undefined) {
       campaign.keywords = data.keywords.map((kw, idx) => ({
         id: `kw_${idx}`,
-        keyword: kw.keyword,
+        keyword: kw.keyword.trim(),
         matchType: kw.matchType || 'contains',
         isEnabled: kw.isEnabled ?? true,
       }));
+      campaign.processedCommentIds = [];
     }
     if (data.dmTemplate !== undefined) {
       campaign.dmTemplate = {
@@ -161,27 +163,37 @@ export class CampaignService {
 
   async processCommentForActiveCampaign(
     data: ProcessCampaignCommentInput,
-    sendPrivateReply: PrivateReplySender,
+    sendCommentReply: CommentReplySender,
     userId?: string
   ): Promise<ProcessCampaignCommentResult> {
+    const postIds = [...new Set([data.postId, ...(data.postIdAliases || [])].filter(Boolean))];
     const campaigns = await CampaignModel.find({
       ...(userId ? { userId } : {}),
       status: 'active',
-      'posts.postId': data.postId,
+      'posts.postId': { $in: postIds },
     }).select('+processedCommentIds').sort({ createdAt: 1 });
 
     if (campaigns.length === 0) {
+      logger.info(
+        `Comment ignored: no active campaign for postIds=${postIds.join(',')} commentId=${data.commentId}`
+      );
       throw new NotFoundError('No active campaign found for this post');
     }
 
     for (const campaign of campaigns) {
       if (campaign.processedCommentIds?.includes(data.commentId)) {
+        logger.info(
+          `Comment skipped: already processed campaignId=${campaign._id} commentId=${data.commentId}`
+        );
         continue;
       }
 
       campaign.analytics.totalComments += 1;
 
-      if (!this.commentMatchesCampaign(data.text, campaign)) {
+      const matchResult = this.evaluateCommentMatch(data.text, campaign);
+      this.logCommentEvaluation(data, campaign, matchResult);
+
+      if (!matchResult.matched) {
         this.markCommentProcessed(campaign, data.commentId);
         await campaign.save();
         continue;
@@ -208,16 +220,16 @@ export class CampaignService {
         throw new BadRequestError('Connected Instagram account is missing or inactive');
       }
 
-      const accessToken = env.facebook.pageAccessToken || account?.accessToken;
+      const accessToken = account.accessToken || env.facebook.pageAccessToken;
 
       if (!accessToken) {
         campaign.analytics.dmsFailed += 1;
         await campaign.save();
-        throw new BadRequestError('PAGE_ACCESS_TOKEN must be set in .env.local');
+        throw new BadRequestError('Connected Instagram access token or PAGE_ACCESS_TOKEN must be set');
       }
 
       try {
-        await sendPrivateReply(data.commentId, message, accessToken, account.instagramUserId);
+        await sendCommentReply(data.commentId, message, accessToken);
         this.markCommentProcessed(campaign, data.commentId);
         campaign.analytics.dmsSent += 1;
         campaign.analytics.dmsDelivered += 1;
@@ -248,24 +260,124 @@ export class CampaignService {
   }
 
   private commentMatchesCampaign(text: string, campaign: Record<string, any>): boolean {
-    if (campaign.triggerType === 'all_comments') return true;
+    return this.evaluateCommentMatch(text, campaign).matched;
+  }
 
-    const normalizedText = text.toLowerCase().trim();
-    return campaign.keywords.some((keyword: { isEnabled: boolean; keyword: string; matchType: string }) => {
-      if (!keyword.isEnabled) return false;
+  private evaluateCommentMatch(text: string, campaign: Record<string, any>): CommentMatchResult {
+    if (campaign.triggerType === 'all_comments') {
+      return { matched: true, reason: 'trigger_type_all_comments' };
+    }
 
-      const value = keyword.keyword.toLowerCase().trim();
-      if (keyword.matchType === 'exact') return normalizedText === value;
+    const normalizedText = this.normalizeKeywordText(text);
+    const keywords = campaign.keywords || [];
+
+    if (keywords.length === 0) {
+      return { matched: false, reason: 'no_keywords', normalizedText };
+    }
+
+    for (const keyword of keywords as Array<{ isEnabled: boolean; keyword: string; matchType: string }>) {
+      if (!keyword.isEnabled) continue;
+
+      const rawKeyword = keyword.keyword.trim();
+      if (!rawKeyword) continue;
+
       if (keyword.matchType === 'regex') {
         try {
-          return new RegExp(keyword.keyword, 'i').test(text);
+          const matched = new RegExp(rawKeyword, 'i').test(text);
+          if (matched) {
+            return {
+              matched: true,
+              reason: 'regex_match',
+              matchedKeyword: rawKeyword,
+              matchType: keyword.matchType,
+              normalizedText,
+            };
+          }
         } catch {
-          return false;
+          continue;
         }
+        continue;
       }
 
-      return normalizedText.includes(value);
-    });
+      for (const candidate of this.getKeywordCandidates(rawKeyword)) {
+        const value = this.normalizeKeywordText(candidate);
+        if (!value) continue;
+
+        if (keyword.matchType === 'exact') {
+          if (normalizedText === value) {
+            return {
+              matched: true,
+              reason: 'exact_match',
+              matchedKeyword: candidate,
+              matchType: keyword.matchType,
+              normalizedText,
+              normalizedKeyword: value,
+            };
+          }
+          continue;
+        }
+
+        if (normalizedText.includes(value)) {
+          return {
+            matched: true,
+            reason: 'contains_match',
+            matchedKeyword: candidate,
+            matchType: keyword.matchType,
+            normalizedText,
+            normalizedKeyword: value,
+          };
+        }
+      }
+    }
+
+    return { matched: false, reason: 'no_keyword_match', normalizedText };
+  }
+
+  private getKeywordCandidates(keyword: string): string[] {
+    return keyword
+      .split(/[\n,]+/)
+      .map((candidate) => candidate.trim())
+      .filter(Boolean);
+  }
+
+  private normalizeKeywordText(value: string): string {
+    return value
+      .normalize('NFKC')
+      .toLowerCase()
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/(^|\s)#(?=\S)/g, '$1')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim()
+      .replace(/\s+/g, ' ');
+  }
+
+  private logCommentEvaluation(
+    data: ProcessCampaignCommentInput,
+    campaign: Record<string, any>,
+    matchResult: CommentMatchResult
+  ): void {
+    const enabledKeywords = (campaign.keywords || [])
+      .filter((keyword: { isEnabled: boolean }) => keyword.isEnabled)
+      .map((keyword: { keyword: string; matchType: string }) => `${keyword.keyword.trim()}(${keyword.matchType})`)
+      .join(', ');
+
+    logger.info(
+      [
+        'Comment evaluated',
+        `campaignId=${campaign._id}`,
+        `campaignName="${this.formatLogText(String(campaign.name || ''))}"`,
+        `postId=${data.postId}`,
+        `commentId=${data.commentId}`,
+        `matched=${matchResult.matched}`,
+        `reason=${matchResult.reason}`,
+        `keywords="${this.formatLogText(enabledKeywords || 'none')}"`,
+        matchResult.normalizedKeyword ? `normalizedKeyword="${this.formatLogText(matchResult.normalizedKeyword)}"` : '',
+      ].filter(Boolean).join(' ')
+    );
+  }
+
+  private formatLogText(value: string): string {
+    return value.replace(/\s+/g, ' ').slice(0, 200).replace(/"/g, '\\"');
   }
 
   private sanitizeCampaign(campaign: Record<string, unknown>): Campaign {
@@ -281,6 +393,7 @@ export class CampaignService {
 
 export interface ProcessCampaignCommentInput {
   postId: string;
+  postIdAliases?: string[];
   commentId: string;
   text: string;
 }
@@ -292,11 +405,19 @@ export interface ProcessCampaignCommentResult {
   instagramAccountId?: string;
 }
 
-type PrivateReplySender = (
+interface CommentMatchResult {
+  matched: boolean;
+  reason: string;
+  matchedKeyword?: string;
+  matchType?: string;
+  normalizedText?: string;
+  normalizedKeyword?: string;
+}
+
+type CommentReplySender = (
   commentId: string,
   message: string,
-  accessToken: string,
-  instagramUserId: string
+  accessToken: string
 ) => Promise<void>;
 
 export const campaignService = new CampaignService();

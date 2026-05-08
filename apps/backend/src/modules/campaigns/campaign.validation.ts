@@ -19,7 +19,7 @@ export const createCampaignSchema = z.object({
   posts: z.array(campaignPostSchema).min(1, 'Select at least one Instagram post or reel').optional(),
   keywords: z.array(
     z.object({
-      keyword: z.string().min(1),
+      keyword: z.string().trim().min(1).max(100),
       matchType: z.enum(['exact', 'contains', 'regex']).default('contains'),
       isEnabled: z.boolean().default(true),
     })

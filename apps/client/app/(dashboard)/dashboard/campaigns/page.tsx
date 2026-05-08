@@ -286,7 +286,7 @@ export default function CampaignsPage() {
 
                 {/* Actions */}
                 <div className="mt-5 flex gap-2">
-                  {campaign.status === 'draft' && (
+                  {(campaign.status === 'draft' || campaign.status === 'paused') && (
                     <Button
                       size="sm"
                       variant="outline"

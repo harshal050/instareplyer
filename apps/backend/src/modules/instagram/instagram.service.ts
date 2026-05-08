@@ -11,9 +11,11 @@ import logger from '../../utils/logger.js';
 const GRAPH_API_VERSION = 'v25.0';
 const FACEBOOK_GRAPH_URL = `https://graph.facebook.com/${GRAPH_API_VERSION}`;
 const FACEBOOK_DIALOG_URL = `https://www.facebook.com/${GRAPH_API_VERSION}`;
+const COMMENT_POLL_INTERVAL_MS = 120_000;
+const INITIAL_COMMENT_POLL_DELAY_MS = 15_000;
 
 export class InstagramService {
-  private lastMessageAt = 0;
+  private lastReplyAt = 0;
   private pollTimer?: NodeJS.Timeout;
   private isPolling = false;
 
@@ -39,7 +41,6 @@ export class InstagramService {
         'pages_read_engagement',
         'instagram_basic',
         'instagram_manage_comments',
-        'instagram_manage_messages',
         'business_management',
       ].join(','),
     });
@@ -104,25 +105,16 @@ export class InstagramService {
       throw new NotFoundError('Instagram account not found');
     }
 
-    const params = new URLSearchParams({
-      fields: 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp',
-      access_token: account.accessToken,
-      limit: '50',
-    });
-    const response = await fetch(`${FACEBOOK_GRAPH_URL}/${account.instagramUserId}/media?${params}`);
-    const data = (await response.json()) as { data?: InstagramMedia[]; error?: { message?: string } };
+    const accessToken = account.accessToken || env.facebook.pageAccessToken || '';
+    const media = await this.fetchAccountMedia(account.instagramUserId, accessToken);
 
-    if (!response.ok || data.error) {
-      throw new BadRequestError(data.error?.message || 'Unable to fetch Instagram media');
-    }
-
-    return (data.data || []).map((media) => ({
-      postId: media.id,
-      postUrl: media.permalink,
-      mediaType: this.mapMediaType(media.media_type),
-      mediaUrl: media.media_url,
-      thumbnail: media.thumbnail_url || media.media_url,
-      caption: media.caption,
+    return media.map((item) => ({
+      postId: item.id,
+      postUrl: item.permalink,
+      mediaType: this.mapMediaType(item.media_type),
+      mediaUrl: item.media_url,
+      thumbnail: item.thumbnail_url || item.media_url,
+      caption: item.caption,
     }));
   }
 
@@ -169,9 +161,9 @@ export class InstagramService {
   async processComment(userId: string, data: ProcessCommentInput): Promise<ProcessCommentResult> {
     return campaignService.processCommentForActiveCampaign(
       data,
-      async (commentId, message, accessToken, instagramUserId) => {
-        await this.waitForMessageSlot();
-        await this.sendPrivateReply(commentId, message, accessToken, instagramUserId);
+      async (commentId, message, accessToken) => {
+        await this.waitForReplySlot();
+        await this.sendCommentReply(commentId, message, accessToken);
       },
       userId
     );
@@ -192,9 +184,9 @@ export class InstagramService {
       try {
         const outcome = await campaignService.processCommentForActiveCampaign(
           event,
-          async (commentId, message, accessToken, instagramUserId) => {
-            await this.waitForMessageSlot();
-            await this.sendPrivateReply(commentId, message, accessToken, instagramUserId);
+          async (commentId, message, accessToken) => {
+            await this.waitForReplySlot();
+            await this.sendCommentReply(commentId, message, accessToken);
           }
         );
         result.processed += 1;
@@ -213,10 +205,7 @@ export class InstagramService {
   }
 
   startCommentPolling(): void {
-    if (this.pollTimer || !env.facebook.pageAccessToken) {
-      if (!env.facebook.pageAccessToken) {
-        logger.warn('Instagram comment polling disabled: PAGE_ACCESS_TOKEN is not set');
-      }
+    if (this.pollTimer) {
       return;
     }
 
@@ -224,15 +213,15 @@ export class InstagramService {
       this.pollActiveCampaignComments().catch((error) => {
         logger.error(`Instagram comment polling failed: ${(error as Error).message}`);
       });
-    }, 30_000);
+    }, COMMENT_POLL_INTERVAL_MS);
 
     setTimeout(() => {
       this.pollActiveCampaignComments().catch((error) => {
         logger.error(`Initial Instagram comment poll failed: ${(error as Error).message}`);
       });
-    }, 5_000);
+    }, INITIAL_COMMENT_POLL_DELAY_MS);
 
-    logger.info('Instagram comment polling started');
+    logger.info(`Instagram comment polling started intervalMs=${COMMENT_POLL_INTERVAL_MS}`);
   }
 
   stopCommentPolling(): void {
@@ -247,10 +236,6 @@ export class InstagramService {
       return { campaigns: 0, posts: 0, comments: 0, matched: 0, sent: 0, skipped: true, errors: [] };
     }
 
-    if (!env.facebook.pageAccessToken) {
-      throw new BadRequestError('PAGE_ACCESS_TOKEN must be set in .env.local');
-    }
-
     this.isPolling = true;
     const result: PollCommentsResult = {
       campaigns: 0,
@@ -263,36 +248,87 @@ export class InstagramService {
     };
 
     try {
-      const campaigns = await CampaignModel.find({ status: 'active' }).select('posts');
+      const campaigns = await CampaignModel.find({ status: 'active' }).select('posts instagramAccountId userId');
       result.campaigns = campaigns.length;
 
-      const postIds = new Set<string>();
+      const accountIds = [...new Set(campaigns.map((campaign) => String(campaign.instagramAccountId)))];
+      const accounts = await InstagramAccountModel.find({
+        _id: { $in: accountIds },
+        isActive: true,
+      }).select('+accessToken');
+      const accountsById = new Map(accounts.map((account) => [String(account._id), account]));
+      const campaignsByAccountId = new Map<string, typeof campaigns>();
+
       for (const campaign of campaigns) {
-        for (const post of campaign.posts || []) {
-          postIds.add(post.postId);
-        }
+        const accountId = String(campaign.instagramAccountId);
+        campaignsByAccountId.set(accountId, [...(campaignsByAccountId.get(accountId) || []), campaign]);
       }
 
-      for (const postId of postIds) {
-        result.posts += 1;
-        const comments = await this.fetchRecentComments(postId);
-        result.comments += comments.length;
+      for (const [accountId, accountCampaigns] of campaignsByAccountId) {
+        const account = accountsById.get(accountId);
+        const accessToken = account?.accessToken || env.facebook.pageAccessToken || '';
+        if (!accessToken) {
+          result.errors.push(`Instagram account ${accountId}: connected Instagram access token is missing`);
+          continue;
+        }
+        if (!account?.instagramUserId) {
+          result.errors.push(`Instagram account ${accountId}: Instagram business ID is missing`);
+          continue;
+        }
 
-        for (const comment of comments.reverse()) {
+        const selectedPostIds = new Set<string>();
+        for (const campaign of accountCampaigns) {
+          for (const post of campaign.posts || []) {
+            selectedPostIds.add(post.postId);
+            if (post.postUrl) selectedPostIds.add(post.postUrl);
+          }
+        }
+
+        let media: InstagramMedia[] = [];
+        try {
+          media = await this.fetchAccountMedia(account.instagramUserId, accessToken);
+        } catch (error) {
+          result.errors.push(`Instagram account ${accountId}: ${(error as Error).message}`);
+          continue;
+        }
+
+        const mediaToCheck = media.filter((item) => {
+          const aliases = [item.id, item.permalink, account.instagramUserId, env.instagram.businessId || ''];
+          return aliases.some((alias) => selectedPostIds.has(alias));
+        });
+
+        for (const item of mediaToCheck) {
+          result.posts += 1;
+          let comments: InstagramComment[] = [];
           try {
-            const outcome = await campaignService.processCommentForActiveCampaign(
-              { postId, commentId: comment.id, text: comment.text },
-              async (commentId, message, accessToken, instagramUserId) => {
-                await this.waitForMessageSlot();
-                await this.sendPrivateReply(commentId, message, accessToken, instagramUserId);
-              }
-            );
-
-            if (outcome.matched) result.matched += 1;
-            if (outcome.sent) result.sent += 1;
+            comments = await this.fetchRecentComments(item.id, accessToken);
           } catch (error) {
-            if (!(error instanceof NotFoundError)) {
-              result.errors.push(`Post ${postId}, comment ${comment.id}: ${(error as Error).message}`);
+            result.errors.push(`Media ${item.id}: ${(error as Error).message}`);
+            continue;
+          }
+          result.comments += comments.length;
+
+          for (const comment of comments.reverse()) {
+            try {
+              const outcome = await campaignService.processCommentForActiveCampaign(
+                {
+                  postId: item.id,
+                  postIdAliases: [item.permalink, account.instagramUserId, env.instagram.businessId || ''],
+                  commentId: comment.id,
+                  text: comment.text,
+                },
+                async (commentId, message, accessToken) => {
+                  await this.waitForReplySlot();
+                  await this.sendCommentReply(commentId, message, accessToken);
+                }
+              );
+
+              if (outcome.matched) result.matched += 1;
+              if (outcome.sent) result.sent += 1;
+            } catch (error) {
+              if (!(error instanceof NotFoundError)) {
+                result.errors.push(`Media ${item.id}, comment ${comment.id}: ${(error as Error).message}`);
+              }
             }
           }
         }
@@ -310,12 +346,12 @@ export class InstagramService {
     }
   }
 
-  private async waitForMessageSlot(): Promise<void> {
-    const elapsed = Date.now() - this.lastMessageAt;
+  private async waitForReplySlot(): Promise<void> {
+    const elapsed = Date.now() - this.lastReplyAt;
     if (elapsed < 1000) {
       await new Promise((resolve) => setTimeout(resolve, 1000 - elapsed));
     }
-    this.lastMessageAt = Date.now();
+    this.lastReplyAt = Date.now();
   }
 
   private extractCommentEvents(payload: InstagramWebhookPayload): ProcessCommentInput[] {
@@ -338,10 +374,31 @@ export class InstagramService {
     return events;
   }
 
-  private async fetchRecentComments(postId: string): Promise<InstagramComment[]> {
+  private async fetchAccountMedia(instagramUserId: string, accessToken: string): Promise<InstagramMedia[]> {
+    const token = accessToken || env.facebook.pageAccessToken;
+    if (!token) {
+      throw new BadRequestError('PAGE_ACCESS_TOKEN must be set in .env.local');
+    }
+
+    const params = new URLSearchParams({
+      fields: 'id,caption,media_type,media_url,thumbnail_url,permalink,timestamp',
+      access_token: token,
+      limit: '50',
+    });
+    const response = await fetch(`${FACEBOOK_GRAPH_URL}/${instagramUserId}/media?${params}`);
+    const data = (await response.json()) as { data?: InstagramMedia[]; error?: GraphApiError };
+
+    if (!response.ok || data.error) {
+      throw new BadRequestError(this.formatGraphError(data.error, 'Unable to fetch Instagram media'));
+    }
+
+    return data.data || [];
+  }
+
+  private async fetchRecentComments(postId: string, accessToken: string): Promise<InstagramComment[]> {
     const params = new URLSearchParams({
       fields: 'id,text,timestamp,username',
-      access_token: env.facebook.pageAccessToken || '',
+      access_token: accessToken,
       limit: '25',
     });
 
@@ -358,36 +415,45 @@ export class InstagramService {
     return data.data || [];
   }
 
-  private async sendPrivateReply(
+  private async sendCommentReply(
     commentId: string,
     message: string,
-    accessToken: string,
-    instagramUserId: string
+    accessToken: string
   ): Promise<void> {
-    const token = env.facebook.pageAccessToken || accessToken;
+    const token = accessToken || env.facebook.pageAccessToken;
     if (!token) {
       throw new BadRequestError('PAGE_ACCESS_TOKEN must be set in .env.local');
     }
-    if (!instagramUserId) {
-      throw new BadRequestError('INSTAGRAM_BUSINESS_ID or connected Instagram account ID is required');
-    }
 
-    const response = await fetch(`${FACEBOOK_GRAPH_URL}/${instagramUserId}/messages`, {
+    const params = new URLSearchParams({ access_token: token });
+    const response = await fetch(`${FACEBOOK_GRAPH_URL}/${commentId}/replies?${params}`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
+        'Content-Type': 'application/x-www-form-urlencoded',
       },
-      body: JSON.stringify({
-        recipient: { comment_id: commentId },
-        message: { text: message },
-      }),
+      body: new URLSearchParams({ message }),
     });
-    const data = (await response.json()) as { error?: GraphApiError };
+    const responseText = await response.text();
+    let data: GraphApiMutationResponse = {};
+
+    try {
+      data = responseText ? JSON.parse(responseText) as GraphApiMutationResponse : {};
+    } catch {
+      data = {};
+    }
 
     if (!response.ok || data.error) {
-      throw new BadRequestError(this.formatGraphError(data.error, 'Unable to send Instagram private reply'));
+      throw new BadRequestError(
+        this.formatGraphError(
+          data.error,
+          `Unable to send Instagram comment reply status=${response.status} body="${this.formatLogText(responseText)}"`
+        )
+      );
     }
+
+    logger.info(
+      `Instagram comment reply sent: commentId=${commentId} replyId=${data.id || 'unknown'}`
+    );
   }
 
   private formatGraphError(error: GraphApiError | undefined, fallback: string): string {
@@ -434,6 +500,10 @@ export class InstagramService {
     } catch {
       throw new BadRequestError('Instagram authorization expired. Please try connecting again.');
     }
+  }
+
+  private formatLogText(value: string): string {
+    return value.replace(/\s+/g, ' ').slice(0, 200).replace(/"/g, '\\"');
   }
 
   private async exchangeCodeForAccessToken(code: string): Promise<FacebookTokenResponse> {
@@ -539,6 +609,12 @@ interface GraphApiError {
   code?: number;
   error_subcode?: number;
   fbtrace_id?: string;
+}
+
+interface GraphApiMutationResponse {
+  id?: string;
+  success?: boolean;
+  error?: GraphApiError;
 }
 
 interface InstagramOAuthState {
