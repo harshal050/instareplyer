@@ -268,17 +268,25 @@ importers:
 
   packages/database:
     dependencies:
-      '@instareplyer/types':
-        specifier: workspace:*
-        version: link:../types
       ioredis:
         specifier: ^5.4.0
         version: 5.10.1
       mongoose:
         specifier: ^8.8.0
         version: 8.23.1
+    devDependencies:
+      '@instareplyer/types':
+        specifier: workspace:*
+        version: link:../types
+      typescript:
+        specifier: 5.7.3
+        version: 5.7.3
 
-  packages/types: {}
+  packages/types:
+    devDependencies:
+      typescript:
+        specifier: 5.7.3
+        version: 5.7.3
 
   packages/utils:
     dependencies:
@@ -288,6 +296,10 @@ importers:
       tailwind-merge:
         specifier: ^3.3.1
         version: 3.4.0
+    devDependencies:
+      typescript:
+        specifier: 5.7.3
+        version: 5.7.3
 
 packages:
 

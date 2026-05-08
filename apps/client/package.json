@@ -4,8 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev --port 3000",
-    "build": "next build",
-    "start": "next start",
+    "build": "pnpm --dir ../.. --filter @instareplyer/types build && pnpm --dir ../.. --filter @instareplyer/utils build && next build --webpack",
+    "start": "next start -H 127.0.0.1",
     "lint": "eslint ."
   },
   "dependencies": {

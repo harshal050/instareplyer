@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "build": "tsc",
+    "build": "pnpm --dir ../.. --filter @instareplyer/types build && pnpm --dir ../.. --filter @instareplyer/database build && tsc",
     "start": "node dist/server.js",
     "lint": "eslint ."
   },

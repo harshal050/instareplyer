@@ -5,14 +5,14 @@ export declare const connectInstagramSchema: z.ZodObject<{
     username: z.ZodString;
     profilePicture: z.ZodOptional<z.ZodString>;
 }, "strip", z.ZodTypeAny, {
+    accessToken: string;
     instagramUserId: string;
     username: string;
-    accessToken: string;
     profilePicture?: string | undefined;
 }, {
+    accessToken: string;
     instagramUserId: string;
     username: string;
-    accessToken: string;
     profilePicture?: string | undefined;
 }>;
 export declare const updateInstagramAccountSchema: z.ZodObject<{

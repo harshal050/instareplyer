@@ -135,7 +135,7 @@ export declare const createCampaignSchema: z.ZodObject<{
         } | undefined;
     }>>;
 }, "strip", z.ZodTypeAny, {
-    status: "active" | "draft" | "paused" | "completed" | "archived";
+    status: "draft" | "active" | "paused" | "completed" | "archived";
     name: string;
     settings: {
         maxDmsPerDay: number;
@@ -190,7 +190,7 @@ export declare const createCampaignSchema: z.ZodObject<{
         }[];
         delay?: number | undefined;
     };
-    status?: "active" | "draft" | "paused" | "completed" | "archived" | undefined;
+    status?: "draft" | "active" | "paused" | "completed" | "archived" | undefined;
     settings?: {
         maxDmsPerDay?: number | undefined;
         replyDelay?: {
@@ -357,7 +357,7 @@ export declare const updateCampaignSchema: z.ZodObject<{
         } | undefined;
     }>>>;
 }, "strip", z.ZodTypeAny, {
-    status?: "active" | "draft" | "paused" | "completed" | "archived" | undefined;
+    status?: "draft" | "active" | "paused" | "completed" | "archived" | undefined;
     name?: string | undefined;
     settings?: {
         maxDmsPerDay: number;
@@ -373,8 +373,8 @@ export declare const updateCampaignSchema: z.ZodObject<{
             start: string;
         } | undefined;
     } | undefined;
-    description?: string | undefined;
     instagramAccountId?: string | undefined;
+    description?: string | undefined;
     triggerType?: "keyword" | "all_comments" | "new_followers" | undefined;
     posts?: {
         postId: string;
@@ -400,7 +400,7 @@ export declare const updateCampaignSchema: z.ZodObject<{
         delay: number;
     } | undefined;
 }, {
-    status?: "active" | "draft" | "paused" | "completed" | "archived" | undefined;
+    status?: "draft" | "active" | "paused" | "completed" | "archived" | undefined;
     name?: string | undefined;
     settings?: {
         maxDmsPerDay?: number | undefined;
@@ -416,8 +416,8 @@ export declare const updateCampaignSchema: z.ZodObject<{
             start: string;
         } | undefined;
     } | undefined;
-    description?: string | undefined;
     instagramAccountId?: string | undefined;
+    description?: string | undefined;
     triggerType?: "keyword" | "all_comments" | "new_followers" | undefined;
     posts?: {
         postId: string;
