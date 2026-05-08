@@ -1,7 +1,7 @@
 {
   "version": 2,
   "installCommand": "cd ../.. && pnpm install --frozen-lockfile",
-  "buildCommand": "cd ../.. && pnpm --filter @instareplyer/backend build",
+  "buildCommand": "cd ../.. && pnpm --filter @instareplyer/types build && pnpm --filter @instareplyer/utils build && pnpm --filter @instareplyer/database build",
   "functions": {
     "api/index.ts": {
       "maxDuration": 60
